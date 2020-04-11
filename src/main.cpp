@@ -186,6 +186,9 @@ void test_image_transfer(const vk::Device & device, const vk::CommandPool & comm
 	for (int y = 0; y < height; y++) {
 		for (int x = 0; x < width; x++) {
 			assert(pixels[y * width + x] == master_color);
+			if (pixels[y * width + x] != master_color) {
+				throw std::runtime_error("validation failed");
+			}
 		}
 	}
 	device.unmapMemory(buffer_mem.get());
