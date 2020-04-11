@@ -91,6 +91,7 @@ std::tuple<vk::UniqueImage, vk::UniqueDeviceMemory> create_device_backed_image(c
 		usage, vk::SharingMode::eExclusive, 0, nullptr, vk::ImageLayout::eUndefined));
 
 	const auto mem_req = device.getImageMemoryRequirements(image.get());
+	std::cout << "image mem_req.size = " << mem_req.size << " mem_req.alignment = " << mem_req.alignment << "\n";
 
 	const auto mem_types = find_memory_type(mem_props, mem_req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
 	if (mem_types.size() == 0)
@@ -109,6 +110,7 @@ std::tuple<vk::UniqueBuffer, vk::UniqueDeviceMemory> create_host_backed_buffer(c
 	auto buffer = device.createBufferUnique(vk::BufferCreateInfo(vk::BufferCreateFlags(), size, usage, vk::SharingMode::eExclusive));
 
 	const auto mem_req = device.getBufferMemoryRequirements(buffer.get());
+	std::cout << "buffer mem_req.size = " << mem_req.size << " mem_req.alignment = " << mem_req.alignment << "\n";
 	const auto mem_types = find_memory_type(mem_props, mem_req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 	if (mem_types.size() == 0)
 		throw std::runtime_error("Failed to find suitable memory type for buffer");
@@ -120,14 +122,28 @@ std::tuple<vk::UniqueBuffer, vk::UniqueDeviceMemory> create_host_backed_buffer(c
 }
 
 
+size_t texel_size(vk::Format format) {
+	if (format == vk::Format::eR8G8B8Unorm)
+		return 3 * 1;
+	else if (format == vk::Format::eR8G8B8A8Unorm)
+		return 4 * 1;
+	else if (format == vk::Format::eR16G16B16Unorm)
+		return 3 * 2;
+	else if (format == vk::Format::eR32G32B32Uint)
+		return 3 * 4;
+	else
+		throw std::invalid_argument("unsupported format");
+}
+
+
+// clear the image with red color, copy image to buffer, check the buffer contents
 void test_image_transfer(const vk::Device & device, const vk::CommandPool & command_pool, const vk::Queue & queue,
 	const vk::PhysicalDeviceMemoryProperties & mem_props, vk::Format format, int width, int height)
 {
 	auto [image, image_mem] = create_device_backed_image(device, mem_props, format, width, height,
 		vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc);
 
-	const size_t pix_size = 3 * 2;
-	const size_t buffer_size = width * height * pix_size;
+	const size_t buffer_size = width * height * texel_size(format);
 	const auto [buffer, buffer_mem] = create_host_backed_buffer(device, mem_props, buffer_size,
 		vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst);
 
@@ -141,19 +157,19 @@ void test_image_transfer(const vk::Device & device, const vk::CommandPool & comm
 		vk::ImageMemoryBarrier(vk::AccessFlags(), vk::AccessFlags(), vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
 		0, 0, image.get(), vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)));
 
-	const auto clear_color = vk::ClearColorValue(std::array<float, 4>{1.0f, 0, 0, 1.0f});
+	const auto clear_color = vk::ClearColorValue(std::array<float, 4>{1.f, 0, 0, 1.f});
 	cmd[0].clearColorImage(image.get(), vk::ImageLayout::eTransferDstOptimal, clear_color,
 		vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
 
-	const auto copy_region = vk::BufferImageCopy(0, width, height,
+	const auto copy_region = vk::BufferImageCopy(0, 0, 0,
 		vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1),
 		vk::Offset3D(0, 0, 0), vk::Extent3D(width, height, 1));
 
 	cmd[0].pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
 		vk::DependencyFlagBits::eByRegion, nullptr, nullptr,
 		vk::ImageMemoryBarrier(vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferRead,
-		vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal, 0, 0,
-		image.get(), vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)));
+			vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal, 0, 0,
+			image.get(), vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)));
 
 	cmd[0].copyImageToBuffer(image.get(), vk::ImageLayout::eTransferSrcOptimal, buffer.get(), copy_region);
 
@@ -165,10 +181,13 @@ void test_image_transfer(const vk::Device & device, const vk::CommandPool & comm
 	device.waitForFences(fence.get(), VK_TRUE, UINT64_MAX);
 
 	const std::byte * mmap = reinterpret_cast<const std::byte *>(device.mapMemory(buffer_mem.get(), 0, VK_WHOLE_SIZE));
-	const auto pixels = reinterpret_cast<const std::array<uint16_t, 3> *>(mmap);
-	assert(pixels[0] == (std::array<uint16_t, 3>{0xFFFF, 0x0000, 0x0000}));
-	assert(pixels[1] == (std::array<uint16_t, 3>{0xFFFF, 0x0000, 0x0000})); //fails here
-	assert(pixels[2] == (std::array<uint16_t, 3>{0xFFFF, 0x0000, 0x0000}));
+	const auto pixels = reinterpret_cast<const std::array<uint8_t, 3> *>(mmap);
+	constexpr std::array<uint8_t, 3> master_color{0xFF, 0x0, 0x0};
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			assert(pixels[y * width + x] == master_color);
+		}
+	}
 	device.unmapMemory(buffer_mem.get());
 }
 
@@ -195,19 +214,24 @@ int main(int argc, char ** argv) {
 		const auto command_pool = device->createCommandPoolUnique(vk::CommandPoolCreateInfo(vk::CommandPoolCreateFlags(), queue_family));
 		const auto queue = device->getQueue(queue_family, 0);
 
-		const auto format = vk::Format::eR16G16B16Unorm;
-		const auto width = 5462;
-		const auto height = 2;
-		//works with this size
-		//const auto width = 256;
-		//const auto height = 256;
-		const auto format_props = phy_device.getFormatProperties(format);
-		assert(width <= props.limits.maxImageDimension2D);
-		assert(height <= props.limits.maxImageDimension2D);
+		const auto height = 12000;
+		auto format_props = phy_device.getFormatProperties(vk::Format::eR32G32B32Uint);
+		assert((format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferSrc)
+			&& (format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferDst));
+		format_props = phy_device.getFormatProperties(vk::Format::eR16G16B16Unorm);
+		assert((format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferSrc)
+			&& (format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferDst));
+		format_props = phy_device.getFormatProperties(vk::Format::eR8G8B8Unorm);
 		assert((format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferSrc)
 			&& (format_props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eTransferDst));
 
-		test_image_transfer(device.get(), command_pool.get(), queue, mem_props, format, width, height);
+		assert(height <= props.limits.maxImageDimension2D);
+		assert(props.limits.maxImageDimension2D >= 6000);
+
+		test_image_transfer(device.get(), command_pool.get(), queue, mem_props, vk::Format::eR8G8B8Unorm, 5460, height);
+		std::cout << "image with width 5460px copied successfully\n";
+		test_image_transfer(device.get(), command_pool.get(), queue, mem_props, vk::Format::eR8G8B8Unorm, 5461, height);
+		std::cout << "will not get here with Intel driver 26.20.100.7528\n";
 
 	} catch (std::exception & e) {
 		assert(false);
